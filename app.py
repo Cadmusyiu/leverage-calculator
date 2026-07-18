@@ -21,6 +21,9 @@ Math model (matches 2802.HK_scenario_analysis.md):
 Run:  streamlit run app.py   (or: python3 -m streamlit run app.py)
 """
 
+from functools import partial
+
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -30,7 +33,8 @@ import streamlit as st
 
 def simulate(initial: float, loan: float, installment: float, months: int,
              div_yield: float, appr: float, loan_rate: float,
-             reinvest: bool = True) -> pd.DataFrame:
+             reinvest: bool = True,
+             deduct_interest: bool = False) -> pd.DataFrame:
     """Month-by-month simulation. Returns one row per month."""
     y = div_yield / 12.0
     g = (1.0 + appr) ** (1.0 / 12.0) - 1.0
@@ -51,7 +55,8 @@ def simulate(initial: float, loan: float, installment: float, months: int,
             cash += div
         own = initial + installment * m
         equity = P + cash - loan
-        profit = equity - own
+        profit = equity - own - (monthly_interest * m if deduct_interest
+                                 else 0.0)
         roi = profit / own if own > 0 else 0.0
         rows.append({
             "month": m,
@@ -72,9 +77,10 @@ def simulate(initial: float, loan: float, installment: float, months: int,
 
 
 def end_state(initial, loan, installment, months, div_yield, appr, loan_rate,
-              reinvest=True) -> dict:
+              reinvest=True, deduct_interest=False) -> dict:
     df = simulate(initial, loan, installment, months, div_yield, appr,
-                  loan_rate, reinvest)
+                  loan_rate, reinvest=reinvest,
+                  deduct_interest=deduct_interest)
     return df.iloc[-1].to_dict()
 
 
@@ -104,6 +110,11 @@ def hkd(v):      return f"${v:,.0f}"
 def mo(v):       return f"M{v}" if v is not None else "N/A"
 
 
+def esc(s):
+    """Escape $ for markdown contexts so Streamlit doesn't render LaTeX."""
+    return s.replace("$", "\\$")
+
+
 # ------------------------------------------------------------------ layout
 
 st.set_page_config(page_title="Leverage Return Calculator",
@@ -113,10 +124,28 @@ st.title("📈 Leverage Return Calculator 槓桿回報計算器")
 st.caption("Covered Call ETF leveraged DCA scenario analysis "
            "槓桿月供情境分析 — based on 2802.HK scenario analysis (2026-07-17)")
 
-# ---- live data fetch (Yahoo Finance via yfinance, no API key needed)
+# ---- shareable-link state: seed widget state from URL query params once
 
-st.session_state.setdefault("price", 7.27)
-st.session_state.setdefault("dist", 0.15)
+QP_DEFAULTS = {"price": 7.27, "dist": 0.15, "initial": 200_000,
+               "loan": 200_000, "inst": 30_000, "rate": 5.0,
+               "dy": 25.0, "appr": 0.0, "months": 36}
+YSRC = ["Manual slider 手動設定", "Implied 由現價/派息推算"]
+MODES = ["Reinvest (DRP) 再投資", "Cash 現金收取"]
+
+if "qp_loaded" not in st.session_state:
+    qp = st.query_params
+    st.session_state["asset"] = qp.get("asset", "2802.HK")
+    for key_, default_ in QP_DEFAULTS.items():
+        try:
+            st.session_state[key_] = type(default_)(float(qp[key_]))
+        except (KeyError, ValueError):
+            st.session_state[key_] = default_
+    st.session_state["ysrc"] = YSRC[1] if qp.get("ysrc") == "implied" else YSRC[0]
+    st.session_state["mode"] = MODES[1] if qp.get("mode") == "cash" else MODES[0]
+    st.session_state["deduct"] = qp.get("deduct") == "1"
+    st.session_state["qp_loaded"] = True
+
+# ---- live data fetch (Yahoo Finance via yfinance, no API key needed)
 
 
 def fetch_market_data():
@@ -144,15 +173,14 @@ def fetch_market_data():
 # ---- sidebar inputs
 with st.sidebar:
     st.header("⚙️ Parameters 參數")
-    asset = st.text_input("Asset 資產 (Yahoo ticker)", value="2802.HK",
-                          key="asset")
+    asset = st.text_input("Asset 資產 (Yahoo ticker)", key="asset")
     st.button("📡 Fetch real data 抓取實時數據", on_click=fetch_market_data,
               width="stretch")
     if "fetch_msg" in st.session_state:
         status, info, div_date = st.session_state.fetch_msg
         if status == "ok":
-            st.success(f"{info}: price ${st.session_state.price:.2f}"
-                       + (f", last dividend ${st.session_state.dist:.3f} "
+            st.success(f"{info}: price \\${st.session_state.price:.2f}"
+                       + (f", last dividend \\${st.session_state.dist:.3f} "
                           f"({div_date})" if div_date else ", no dividend "
                           "history found 找不到派息記錄"))
         else:
@@ -168,35 +196,59 @@ with st.sidebar:
 
     st.divider()
     initial = st.number_input("Initial own capital 初始自有資金 (HKD)",
-                              min_value=0, value=200_000, step=10_000)
+                              min_value=0, step=10_000, key="initial")
     loan = st.number_input("Loan amount 貸款金額 (HKD)",
-                           min_value=0, value=200_000, step=10_000)
+                           min_value=0, step=10_000, key="loan")
     installment = st.slider("Monthly installment 每月月供 (HKD)",
-                            10_000, 100_000, 30_000, step=1_000)
-    loan_rate = st.slider("Loan rate 貸款年利率 (% p.a.)",
-                          0.0, 10.0, 5.0, step=0.25) / 100.0
+                            10_000, 100_000, step=1_000, key="inst")
+    rate_pct = st.slider("Loan rate 貸款年利率 (% p.a.)",
+                         0.0, 10.0, step=0.25, key="rate")
+    loan_rate = rate_pct / 100.0
+    deduct = st.checkbox(
+        "Deduct interest from ROI 扣除利息計 ROI", key="deduct",
+        help="Off: source-analysis convention — interest shown separately, "
+             "not deducted 跟原分析口徑,利息獨立顯示. "
+             "On: profit and ROI are net of cumulative loan interest "
+             "利潤及 ROI 扣除累計利息.")
     st.divider()
     yield_src = st.radio(
-        "Dividend yield source 股息率來源",
-        ["Manual slider 手動設定",
-         "Implied 由現價/派息推算"],
-        index=0,
+        "Dividend yield source 股息率來源", YSRC, key="ysrc",
         help="Manual: use the slider below (md baseline = 25%). "
              "Implied: yield = monthly distribution × 12 ÷ current price, "
              "recalculates when you change price or distribution.")
-    if yield_src.startswith("Implied"):
+    if yield_src == YSRC[1]:
         div_yield = implied
         st.caption(f"Using implied yield 使用隱含息率: "
                    f"**{implied * 100:.1f}%** p.a.")
     else:
         div_yield = st.slider("Dividend yield 股息率 (% p.a.)",
-                              5.0, 30.0, 25.0, step=0.5) / 100.0
+                              5.0, 30.0, step=0.5, key="dy") / 100.0
     appr = st.slider("Asset appreciation 資產升值 (% p.a.)",
-                     -10.0, 10.0, 0.0, step=0.5) / 100.0
-    months = st.slider("Time horizon 投資期 (months)", 6, 60, 36, step=1)
-    treatment = st.radio("Dividend treatment 股息處理",
-                         ["Reinvest (DRP) 再投資", "Cash 現金收取"], index=0)
-    reinvest = treatment.startswith("Reinvest")
+                     -10.0, 10.0, step=0.5, key="appr") / 100.0
+    months = st.slider("Time horizon 投資期 (months)", 6, 60, step=1,
+                       key="months")
+    treatment = st.radio("Dividend treatment 股息處理", MODES, key="mode")
+    reinvest = treatment == MODES[0]
+    st.caption("🔗 The URL always carries the current parameters — copy it "
+               "to share this exact scenario 網址已包含當前參數,複製即可分享.")
+
+# keep the URL in sync so the current scenario is shareable
+st.query_params.update({
+    "asset": asset,
+    "price": f"{price:g}", "dist": f"{dist:g}",
+    "initial": str(int(initial)), "loan": str(int(loan)),
+    "inst": str(int(installment)), "rate": f"{rate_pct:g}",
+    "ysrc": "implied" if yield_src == YSRC[1] else "manual",
+    "dy": f"{st.session_state.dy:g}",
+    "appr": f"{st.session_state.appr:g}",
+    "months": str(int(months)),
+    "mode": "drp" if reinvest else "cash",
+    "deduct": "1" if deduct else "0",
+})
+
+# all scenario computations below honour the interest toggle
+end_state = partial(end_state, deduct_interest=deduct)
+simulate = partial(simulate, deduct_interest=deduct)
 
 start_port = initial + loan
 start_ltv = loan / start_port if start_port > 0 else 0.0
@@ -214,6 +266,13 @@ main = end_state(initial, loan, installment, months, div_yield, appr,
 main_df = simulate(initial, loan, installment, months, div_yield, appr,
                    loan_rate, reinvest)
 
+def show_table(df: pd.DataFrame, name: str, index: bool = False):
+    """Render a table with a CSV download button (utf-8-sig for Excel)."""
+    st.dataframe(df, hide_index=not index, width="stretch")
+    st.download_button("⬇️ CSV", df.to_csv(index=index).encode("utf-8-sig"),
+                       f"{name}.csv", "text/csv", key=f"dl_{name}")
+
+
 # ------------------------------------------------------- quick summary
 
 st.subheader("⚡ Quick Summary 快速摘要")
@@ -226,8 +285,63 @@ c5.metric("End LTV 期末槓桿比率", pct(main["ltv"]))
 st.caption(f"{asset} · {months} months · dividend yield {pct(div_yield)} p.a. · "
            f"appreciation {pct(appr)} p.a. · loan rate {pct(loan_rate)} p.a. · "
            f"{'DRP 再投資' if reinvest else 'Cash 現金'} · "
-           f"Own capital invested 累計自有資金 {k(main['own'])} · "
-           f"Total interest 總利息 {k(main['cum_interest'])}")
+           f"Own capital invested 累計自有資金 {esc(k(main['own']))} · "
+           f"Total interest 總利息 {esc(k(main['cum_interest']))}"
+           + (" (deducted from ROI 已扣入 ROI)" if deduct else ""))
+
+# ------------------------------------------------------- growth curves
+
+st.subheader("📉 Growth Curves 增長曲線")
+hist = pd.concat([
+    pd.DataFrame([{"month": 0, "portfolio": float(start_port), "cash_div": 0.0,
+                   "own": float(initial), "equity": float(initial),
+                   "ltv": start_ltv}]),
+    main_df[["month", "portfolio", "cash_div", "own", "equity", "ltv"]],
+], ignore_index=True)
+hist["Portfolio 組合"] = (hist["portfolio"] + hist["cash_div"]) / 1000
+hist["Equity 淨值"] = hist["equity"] / 1000
+hist["Own Capital 自有資金"] = hist["own"] / 1000
+SERIES = ["Portfolio 組合", "Equity 淨值", "Own Capital 自有資金"]
+SERIES_COLORS = ["#3987e5", "#199e70", "#c98500"]  # CVD-validated, dark surface
+growth_long = hist.melt("month", SERIES, var_name="series", value_name="hkd_k")
+growth_chart = (
+    alt.Chart(growth_long)
+    .mark_line(strokeWidth=2)
+    .encode(
+        x=alt.X("month:Q", title="Month 月", axis=alt.Axis(tickMinStep=1)),
+        y=alt.Y("hkd_k:Q", title="HKD (k)"),
+        color=alt.Color("series:N", title=None,
+                        scale=alt.Scale(domain=SERIES, range=SERIES_COLORS),
+                        legend=alt.Legend(orient="top")),
+        tooltip=[alt.Tooltip("month:Q", title="Month 月"),
+                 alt.Tooltip("series:N", title="Series 系列"),
+                 alt.Tooltip("hkd_k:Q", title="HKD (k)", format=",.0f")],
+    )
+    .properties(height=320)
+)
+gc1, gc2 = st.columns((3, 2))
+with gc1:
+    st.altair_chart(growth_chart, use_container_width=True)
+with gc2:
+    if loan > 0:
+        ltv_hist = hist[["month"]].copy()
+        ltv_hist["ltv_pct"] = hist["ltv"] * 100
+        ltv_chart = (
+            alt.Chart(ltv_hist)
+            .mark_line(strokeWidth=2, color="#3987e5")
+            .encode(
+                x=alt.X("month:Q", title="Month 月",
+                        axis=alt.Axis(tickMinStep=1)),
+                y=alt.Y("ltv_pct:Q", title="LTV (%)"),
+                tooltip=[alt.Tooltip("month:Q", title="Month 月"),
+                         alt.Tooltip("ltv_pct:Q", title="LTV (%)",
+                                     format=".1f")],
+            )
+            .properties(height=320, title="LTV 槓桿比率")
+        )
+        st.altair_chart(ltv_chart, use_container_width=True)
+    else:
+        st.info("No loan — LTV stays at 0% 無貸款,LTV 恆為 0%")
 
 # ------------------------------------------------- table 1: structure comparison
 
@@ -246,7 +360,7 @@ for name, ini, ln in structures:
         "Equity": k(e["equity"]), "Profit": k(e["profit"]),
         "ROI": pct(e["roi"]), "Ann ROI": pct(e["ann_roi"]),
     })
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table1_structure")
 
 # ------------------------------------------------- table 2: appreciation sens.
 
@@ -264,7 +378,7 @@ for name, ini, ln in structures:
             "End LTV": pct(e["ltv"]), "Equity": k(e["equity"]),
             "Profit": k(e["profit"]), "ROI": pct(e["roi"]),
         })
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table2_appreciation")
 
 # ------------------------------------------------- table 3: loan rate sens.
 
@@ -279,7 +393,7 @@ for r in [0.0, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10]:
         "Equity": k(e["equity"]), "Profit": k(e["profit"]),
         "ROI": pct(e["roi"]), "Total Int": k(e["cum_interest"]),
     })
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table3_loan_rate")
 st.caption("Loan is interest-only and revolving — interest affects cash flow, "
            "not portfolio value (dividends reinvested). "
            "貸款為循環式只還息:利息只影響現金流,不影響組合價值。")
@@ -298,7 +412,7 @@ for dy in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]:
         "Profit": k(e["profit"]), "ROI": pct(e["roi"]),
         "Ann ROI": pct(e["ann_roi"]),
     })
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table4_div_yield")
 
 # ------------------------------------------------- table 5: time horizon
 
@@ -315,7 +429,7 @@ for h in horizons:
         "Own Capital": k(e["own"]), "Profit": k(e["profit"]),
         "ROI": pct(e["roi"]), "Ann ROI": pct(e["ann_roi"]),
     })
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table5_horizon")
 
 # ------------------------------------------------- table 6: LTV milestones
 
@@ -339,7 +453,7 @@ for name, ini, ln in structures:
         "LTV≤5%": mo(ltv_milestone(df, 0.05)),
         "End LTV": pct(df.iloc[-1]["ltv"]),
     })
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table6_ltv_milestones")
 st.caption("N/A = not reached within horizon 投資期內未達到")
 
 # ------------------------------------------------- table 7: loan breakeven
@@ -354,14 +468,14 @@ for name, ini, ln in structures[1:]:
         row[f"{a * 100:+.0f}%"] = mo(loan_breakeven(
             ini, ln, installment, div_yield, a, loan_rate, reinvest))
     rows.append(row)
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table7_breakeven")
 
 # ------------------------------------------------- table 8: monthly cash flow
 
 st.subheader("8️⃣ Monthly Cash Flow Timeline 每月現金流")
-st.caption(f"Out-of-pocket 每月自付 = {hkd(installment)} DCA installment "
+st.caption(f"Out-of-pocket 每月自付 = {esc(hkd(installment))} DCA installment "
            f"(buys more units 用於買入資產) + "
-           f"{hkd(loan * loan_rate / 12)} loan interest 貸款利息. "
+           f"{esc(hkd(loan * loan_rate / 12))} loan interest 貸款利息. "
            "Net CF = dividend − installment − interest, a hypothetical view "
            "if dividends were taken as cash 假設股息以現金收取時的淨現金流.")
 show_months = [m for m in range(1, 13) if m <= months] + \
@@ -381,7 +495,7 @@ for m in show_months:
         "Net CF (cash div)": f"{'+' if r['div'] - cash_out >= 0 else ''}"
                              f"{hkd(r['div'] - cash_out)}",
     })
-st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+show_table(pd.DataFrame(rows), "table8_cashflow")
 be = main_df[main_df["div"] >= installment + main_df["interest"]]
 if not be.empty:
     st.caption(f"✅ Cash flow turns positive at ~Month "
@@ -409,6 +523,8 @@ st.dataframe(
           .format("{:.1f}%"),
     width="stretch",
 )
+st.download_button("⬇️ CSV", matrix.round(1).to_csv().encode("utf-8-sig"),
+                   "table9_matrix.csv", "text/csv", key="dl_table9_matrix")
 
 # ------------------------------------------------- caveats
 
