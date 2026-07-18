@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**🔴 Live Demo 線上試用: https://leverage-calculator.streamlit.app**
+**🔴 Live Demo 線上試用: https://chocoinvesting-leverage-calculator.streamlit.app**
 
 Interactive Streamlit tool for analyzing **leveraged DCA strategies on high-yield
 covered call ETFs** (e.g. 2802.HK). Models monthly installments, revolving
