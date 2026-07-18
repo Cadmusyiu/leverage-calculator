@@ -1,6 +1,6 @@
 # 📈 Leverage Return Calculator 槓桿回報計算器
 
-![CI](https://github.com/YOUR_GITHUB_USERNAME/leverage-calculator/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Cadmusyiu/leverage-calculator/actions/workflows/ci.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
